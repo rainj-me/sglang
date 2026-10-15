@@ -36,6 +36,13 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         self.supports_prefill = _is_blackwell()
         self._extend_fn: Optional[callable] = None
         self._l2norm_fn: Optional[callable] = None
+        self._l2norm_3d_fn: Optional[callable] = None
+        # (query_start_loc, int32 copy): the backend hands every KDA layer of a
+        # forward the same query_start_loc tensor, so converting it once keeps
+        # chunk_kda_cutedsl's identity-keyed metadata cache warm across layers.
+        # A fresh `.to(int32)` per layer defeated that cache and cost a host
+        # sync (`.item()`) plus the chunk-metadata and eye recompute per layer.
+        self._cu_seqlens_cache: Optional[tuple[torch.Tensor, torch.Tensor]] = None
 
     def _ensure_extend_loaded(self, head_k_dim: int) -> None:
         if self._extend_fn is not None:
@@ -53,13 +60,14 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
             raise RuntimeError(
                 f"CuTe DSL KDA prefill requires head_k_dim=128, got {head_k_dim}."
             )
-        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+        from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_3d
         from sglang.kernels.ops.attention.linear.kda_blackwell import (
             chunk_kda_cutedsl,
         )
 
         self._extend_fn = chunk_kda_cutedsl
         self._l2norm_fn = l2norm_fwd
+        self._l2norm_3d_fn = l2norm_fwd_3d
         logger.info("Using CuTe DSL KDA prefill (Blackwell)")
 
     def decode(
@@ -128,9 +136,13 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         head_k_dim = k.shape[-1]
         self._ensure_extend_loaded(head_k_dim)
 
-        # [1, T, HV, D] -> [T, HV, D]; L2-norm Q/K outside the kernel.
-        q_n = self._l2norm_fn(q[0].contiguous()).to(torch.bfloat16)
-        k_n = self._l2norm_fn(k[0].contiguous()).to(torch.bfloat16)
+        # [1, T, HV, D] -> [T, HV, D]; L2-norm Q/K outside the kernel. q/k/v
+        # arrive as head-split views of one fused projection (unit stride only
+        # on the head dim), so normalize straight from the strided view into a
+        # contiguous bf16 result instead of materializing a contiguous copy
+        # first: one read+write of q and k saved per layer.
+        q_n = self._l2norm_3d_fn(q[0], output_dtype=torch.bfloat16)
+        k_n = self._l2norm_3d_fn(k[0], output_dtype=torch.bfloat16)
         v_in = v[0].contiguous().to(torch.bfloat16)
         # Trim g/beta to q's real token count: the [:real_num_tokens] slice in
         # unified_linear_attention_with_output narrows their batch dim (a no-op),
@@ -140,7 +152,14 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
         beta_in = beta[0][:num_tokens].to(torch.float32)
         if kwargs.get("beta_is_raw"):
             beta_in = beta_in.sigmoid()
-        cu_seqlens = query_start_loc.to(torch.int32)
+        if query_start_loc.dtype == torch.int32:
+            cu_seqlens = query_start_loc
+        else:
+            cached = self._cu_seqlens_cache
+            if cached is None or cached[0] is not query_start_loc:
+                cached = (query_start_loc, query_start_loc.to(torch.int32))
+                self._cu_seqlens_cache = cached
+            cu_seqlens = cached[1]
 
         # Pool state I/O is fused into the h kernel's TMA load/store: pass the
         # pool + per-seq slots and the kernel reads h0/writes ht in place at

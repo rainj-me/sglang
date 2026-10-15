@@ -1953,6 +1953,13 @@ class Envs:
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Quantize K3's attention projections (KDA and MLA linears; not the conv
+    # or norms) to 128x128 block-FP8 at load time when the checkpoint leaves
+    # them in bf16 (the MXFP4 release), so they run on the same DeepGEMM
+    # W8A8 path as the ModelOpt FP8_PB_WO checkpoint, with dynamic per-token
+    # activation scales. Direct quantization without calibration; off by
+    # default until accuracy is validated for the deployment.
+    SGLANG_K3_USE_ONLINE_FP8_ATTN = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

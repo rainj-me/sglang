@@ -173,6 +173,48 @@ def _uses_modelopt_fp8_pb_wo(
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
 
 
+def _is_k3_online_fp8_attn_target(prefix: str) -> bool:
+    """The attention linears that go block-FP8 under
+    SGLANG_K3_USE_ONLINE_FP8_ATTN: every LinearBase under self_attn except
+    the KDA short convolution (an unquantized MergedColumnParallelLinear)."""
+    return ".self_attn." in prefix and "conv1d" not in prefix
+
+
+def _maybe_enable_online_fp8_attn(quant_config: Optional[QuantizationConfig]) -> None:
+    """Install online 128x128 block-FP8 for the attention projections on a
+    checkpoint that leaves them in bf16, mirroring the ModelOpt FP8_PB_WO
+    layout: the compressed-tensors config routes matching linears to
+    Fp8LinearMethod (which quantizes after load) and resolves them as
+    ``FP8_PB_WO`` so K3's block-FP8 branches engage."""
+    if not envs.SGLANG_K3_USE_ONLINE_FP8_ATTN.get():
+        return
+    if quant_config is None or not hasattr(quant_config, "linear_fp8_targets"):
+        rank0_log(
+            "SGLANG_K3_USE_ONLINE_FP8_ATTN needs a compressed-tensors checkpoint "
+            f"(got {type(quant_config).__name__}); leaving attention as loaded."
+        )
+        return
+    if quant_config.linear_fp8_config is not None:
+        rank0_log(
+            "SGLANG_K3_USE_ONLINE_FP8_ATTN: checkpoint already carries a "
+            "linear_fp8_config; leaving it in place."
+        )
+        return
+    from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+    quant_config.linear_fp8_config = Fp8Config(
+        is_checkpoint_fp8_serialized=False,
+        activation_scheme="dynamic",
+        weight_block_size=[128, 128],
+        packed_modules_mapping=quant_config.packed_modules_mapping,
+    )
+    quant_config.linear_fp8_targets = _is_k3_online_fp8_attn_target
+    rank0_log(
+        "Kimi-K3: attention projections will be quantized to 128x128 block-FP8 "
+        "at load (SGLANG_K3_USE_ONLINE_FP8_ATTN=1)."
+    )
+
+
 def _uses_split_gguf_kv_b(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:
@@ -392,6 +434,11 @@ def _route_sp_o_proj_output(o_proj: RowParallelLinear) -> None:
     symmetric buffer whenever K3's tuned reduce-scatter for that row count
     reads through it (the bank's FFN read); otherwise the stage boundary
     reduce-scatters it from regular memory."""
+    if not _o_proj_takes_output(o_proj):
+        # A quantized o_proj (e.g. block-FP8) has no apply_into; its output
+        # stays in regular memory and the stage boundary falls back to the
+        # NCCL reduce-scatter for the buckets that would have used pull RS.
+        return
     if k3_sp_collective.enabled():
         # The table selects NVLS pull RS for larger token buckets.
         # Only those o_proj outputs come from the persistent symmetric
@@ -3004,6 +3051,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                         **self.packed_modules_mapping,
                     }
                 )
+        _maybe_enable_online_fp8_attn(quant_config)
         self.model = KimiK3LinearModel(
             config, quant_config, prefix=maybe_prefix(prefix, "model")
         )

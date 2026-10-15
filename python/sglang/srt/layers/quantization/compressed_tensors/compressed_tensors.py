@@ -8,6 +8,7 @@ from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -138,6 +139,27 @@ class CompressedTensorsConfig(QuantizationConfig):
         self.config = config
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.linear_fp8_config = linear_fp8_config
+        # Optional prefix predicate narrowing linear_fp8_config to a subset of
+        # the linears (None = every LinearBase). Model code may install both,
+        # e.g. Kimi-K3 quantizing its bf16 attention projections online.
+        self.linear_fp8_targets: Optional[Callable[[str], bool]] = None
+
+    def _linear_fp8_applies(self, prefix: str) -> bool:
+        if self.linear_fp8_config is None:
+            return False
+        targets = self.linear_fp8_targets
+        return targets is None or targets(prefix)
+
+    def _resolve_quant_algo(self, prefix: str) -> Optional[str]:
+        """ModelOpt-style per-prefix algo name for the linear_fp8_config
+        override, so model code keyed on ``FP8_PB_WO`` (2D block-FP8) sees
+        these linears the way it sees a ModelOpt mixed checkpoint."""
+        if not self._linear_fp8_applies(prefix):
+            return None
+        block = getattr(self.linear_fp8_config, "weight_block_size", None)
+        if block is not None and len(block) == 2 and min(block) > 1:
+            return "FP8_PB_WO"
+        return "FP8"
 
     @property
     def kv_cache_quant_algo(self) -> Optional[str]:
@@ -189,7 +211,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         if isinstance(layer, LinearBase):
             # If linear_fp8_config is set, use FP8 for linear layers
             # This allows mixed quantization: experts with int4, linear layers with fp8
-            if self.linear_fp8_config is not None:
+            if self._linear_fp8_applies(prefix):
                 return Fp8LinearMethod(self.linear_fp8_config)
             scheme = self.get_linear_scheme(layer=layer, layer_name=prefix)
             if scheme is None:

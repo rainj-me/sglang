@@ -297,10 +297,8 @@ class Fp8Config(QuantizationConfig):
         # "ue8m0" checkpoints quantize activations with power-of-two scales.
         self.scale_fmt = scale_fmt
         if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
-                raise ValueError(
-                    "The block-wise quantization only supports fp8-serialized checkpoint for now."
-                )
+            # An unserialized checkpoint with a block size quantizes its
+            # weights online in Fp8LinearMethod.process_weights_after_loading.
             if len(weight_block_size) != 2:
                 raise ValueError(
                     f"The quantization block size of weight must have 2 dimensions, but got {len(weight_block_size)} dimensions."
@@ -732,11 +730,46 @@ class Fp8LinearMethod(LinearMethodBase):
             params_dtype=params_dtype,
         )
 
+    def _quantize_block_fp8_weights_online(self, layer: Module) -> None:
+        """Block-quantize a bf16/fp16 weight loaded from an unquantized
+        checkpoint: fp8 e4m3 weight plus a per-[block_n, block_k] fp32
+        ``weight_scale_inv`` (amax / fp8_max), the layout a serialized
+        block-FP8 checkpoint carries, so the rest of the post-load path
+        (fnuz normalization, DeepGEMM UE8M0 requant, backend relayouts)
+        applies unchanged."""
+        weight = layer.weight.data
+        if weight.dtype == torch.float8_e4m3fn:
+            return
+        block_n, block_k = self.weight_block_size
+        n, k = weight.shape
+        pad_n = (n + block_n - 1) // block_n * block_n
+        pad_k = (k + block_k - 1) // block_k * block_k
+        padded = torch.zeros((pad_n, pad_k), dtype=torch.float32, device=weight.device)
+        padded[:n, :k] = weight.float()
+        blocks = padded.view(pad_n // block_n, block_n, pad_k // block_k, block_k)
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        scale = blocks.abs().amax(dim=(1, 3), keepdim=True).clamp(min=1e-12) / fp8_max
+        qweight = (
+            (blocks / scale)
+            .clamp(-fp8_max, fp8_max)
+            .to(torch.float8_e4m3fn)
+            .view(pad_n, pad_k)[:n, :k]
+            .contiguous()
+        )
+        layer.weight = Parameter(qweight, requires_grad=False)
+        layer.weight_scale_inv = Parameter(
+            scale.view(pad_n // block_n, pad_k // block_k).contiguous(),
+            requires_grad=False,
+        )
+        layer.input_scale = None
+
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
         )
+        if not self.is_checkpoint_fp8_serialized and not self.use_mxfp8:
+            self._quantize_block_fp8_weights_online(layer)
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,

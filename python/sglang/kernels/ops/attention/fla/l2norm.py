@@ -304,3 +304,66 @@ class L2Norm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return l2norm(x, self.eps, self.output_dtype)
+
+
+@triton.jit(do_not_specialize=["T"])
+def l2norm_fwd_kernel_3d(
+    x,
+    y,
+    eps,
+    T,
+    s_xt,
+    s_xh,
+    s_yt,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # One program per (BT-token block, head). ``x`` may be a strided [T, H, D]
+    # view (e.g. one split of a fused qkv projection); ``y`` is contiguous.
+    i_t = tl.program_id(0)
+    i_h = tl.program_id(1)
+    p_x = tl.make_block_ptr(
+        x + i_h * s_xh, (T, D), (s_xt, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+    )
+    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    b_var = tl.sum(b_x * b_x, axis=1)
+    b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+    p_y = tl.make_block_ptr(
+        y + i_h * D, (T, D), (s_yt, 1), (i_t * BT, 0), (BT, BD), (1, 0)
+    )
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+
+
+def l2norm_fwd_3d(
+    x: torch.Tensor, eps: float = 1e-6, output_dtype: Optional[torch.dtype] = None
+) -> torch.Tensor:
+    """L2-normalize the last dim of a [T, H, D] tensor whose T/H strides are
+    arbitrary (last dim must be unit-stride), writing a contiguous result.
+
+    Lets callers normalize a head-split view of a fused projection directly
+    instead of ``x.contiguous()`` followed by :func:`l2norm_fwd`, which costs a
+    full extra read+write of ``x``.
+    """
+    assert x.ndim == 3 and x.stride(-1) == 1, (x.shape, x.stride())
+    T, H, D = x.shape
+    assert D <= 512, "l2norm_fwd_3d supports head dims up to 512"
+    y = torch.empty((T, H, D), dtype=output_dtype or x.dtype, device=x.device)
+    if T == 0:
+        return y
+    BD = triton.next_power_of_2(D)
+    l2norm_fwd_kernel_3d[(triton.cdiv(T, 16), H)](
+        x,
+        y,
+        eps,
+        T,
+        x.stride(0),
+        x.stride(1),
+        y.stride(0),
+        D=D,
+        BT=16,
+        BD=BD,
+        num_warps=8,
+        num_stages=3,
+    )
+    return y
