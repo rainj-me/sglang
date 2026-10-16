@@ -10,6 +10,9 @@ from sglang.kernels.ops.attention.metadata import (
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
+    mla_kv_pack_quantize_fp8,
+)
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
@@ -379,6 +382,29 @@ class FlashAttentionBackend(AttentionBackend):
         self._disable_scheduler_metadata_precompute = (
             _should_disable_scheduler_metadata_precompute()
         )
+
+        # Dense K/V for the chunked-prefix MHA path (forward_mha reads this
+        # attribute; None selects its generic path). With an fp8 KV cache and
+        # FA4, K/V are packed once into unit-scale fp8 and the kernel runs fp8.
+        self.pack_prefix_chunk_kv = (
+            self._pack_prefix_chunk_kv_fp8
+            if self.fa_impl_ver == 4 and self.kv_cache_dtype == torch.float8_e4m3fn
+            else None
+        )
+
+    def _pack_prefix_chunk_kv_fp8(
+        self, k_nope: torch.Tensor, k_pe: torch.Tensor, v: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return mla_kv_pack_quantize_fp8(
+            k_nope, k_pe, v, fp8_dtype=torch.float8_e4m3fn, enable_pdl=False
+        )
+
+    def _prepare_mha_qkv_dtypes(self, q, k, v):
+        """Dense-K/V MLA prefill: FA4 runs fp8 when K/V arrive already packed as
+        unit-scale fp8 (pack_prefix_chunk_kv); otherwise K/V follow q's dtype."""
+        if self.fa_impl_ver == 4 and k.dtype == torch.float8_e4m3fn:
+            return q.to(torch.float8_e4m3fn), k, v
+        return q, k.to(q.dtype), v.to(q.dtype)
 
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
@@ -1877,6 +1903,7 @@ class FlashAttentionBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 # Do multi-head attention with chunked prefix cache
+                q_mha, k_mha, v_mha = self._prepare_mha_qkv_dtypes(q, k, v)
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_schedule().disable_chunked_prefix_cache
                     # MHA for chunked prefix kv cache when running model with MLA
@@ -1889,9 +1916,9 @@ class FlashAttentionBackend(AttentionBackend):
 
                     assert forward_batch.mha_return_lse
                     output = flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        q=q_mha.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k=k_mha.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v=v_mha.view(-1, layer.tp_k_head_num, layer.v_head_dim),
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=forward_batch.prefix_chunk_cu_seq_lens[chunk_idx],
                         max_seqlen_q=metadata.max_seq_len_q,
@@ -1916,9 +1943,9 @@ class FlashAttentionBackend(AttentionBackend):
                         else metadata.max_seq_len_k
                     )
                     output = flash_attn_varlen_func(
-                        q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
-                        k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
-                        v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
+                        q=q_mha.view(-1, layer.tp_q_head_num, layer.head_dim),
+                        k=k_mha.view(-1, layer.tp_k_head_num, layer.head_dim),
+                        v=v_mha.view(-1, layer.tp_k_head_num, layer.v_head_dim),
                         cu_seqlens_q=metadata.cu_seqlens_q,
                         cu_seqlens_k=cu_seqlens_k,
                         max_seqlen_q=metadata.max_seq_len_q,

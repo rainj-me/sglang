@@ -290,7 +290,7 @@ class DeepseekMHAForwardMixin:
 
         pack_fn = (
             getattr(resolve_attn_backend(forward_batch), "pack_prefix_chunk_kv", None)
-            if self.current_attention_backend == "trtllm_mla"
+            if self.current_attention_backend in ("trtllm_mla", "fa4")
             else None
         )
         if pack_fn is not None:

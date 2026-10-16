@@ -3938,7 +3938,10 @@ class FlashAttentionForwardSm100:
                 descale_tensors, batch_idx, kv_head_idx
             )
 
-            max_offset = 8 if cutlass.const_expr(self.v_mma_dtype.width == 8) else 0
+            # e4m3 saturates at 448 = 2^8.8: with the row max allowed to lag by
+            # rescale_threshold (4) log2 units, P reaches 2^(max_offset + 4), so
+            # max_offset must be <= 4 (upstream flash-attention PR #2717).
+            max_offset = 4 if cutlass.const_expr(self.v_mma_dtype.width == 8) else 0
             if const_expr(self.has_bias):
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = base_softmax_scale * qk_descale
@@ -4623,12 +4626,12 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
 
             max_offset = (
-                Float32(8.0)
+                Float32(4.0)
                 if cutlass.const_expr(self.v_mma_dtype.width == 8)
                 else Float32(0.0)
             )
             max_offset_scale = (
-                Float32(256.0)
+                Float32(16.0)
                 if cutlass.const_expr(self.v_mma_dtype.width == 8)
                 else Float32(1.0)
             )
