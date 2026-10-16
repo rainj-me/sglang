@@ -23,6 +23,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from functools import partial
 from typing import Callable, Literal, NamedTuple, Optional, Tuple
 
@@ -371,8 +372,22 @@ class FlashAttentionForwardSm100:
         # taken over the raw S, so it is only used on tiles that need no masking and when
         # nothing rewrites S before the max (score_mod / bias); there it equals the
         # software reduction exactly.
+        # Pipelined fp8 softmax (sm_103, 8-bit inputs): fragment TMEM loads
+        # with tcgen05.ld.red.max overlapped with the exp chain, FA4's lagging
+        # row max decided when the last fragment lands, rare rescales of O and
+        # of the early fragments behind a warp-uniform vote. Measured on GB300
+        # for the 192/128 MLA shape: 5.43 -> 5.19 ms (32k dense), 2.77 -> 2.69
+        # (32k causal), 22.46 -> 22.08 (32k q x 128k keys); results carry one
+        # extra rounding only in tiles where the lagging max moves.
+        # SGLANG_FA4_PIPELINED_SOFTMAX=0 disables it.
+        self.pipelined_softmax = (
+            os.environ.get("SGLANG_FA4_PIPELINED_SOFTMAX", "1") == "1"
+            and is_sm103
+            and score_mod is None
+            and not has_bias
+        )
         self.use_tmem_load_red_max = (
-            tmem_load_red_max and is_sm103 and score_mod is None and not has_bias
+            (tmem_load_red_max or self.pipelined_softmax) and is_sm103 and score_mod is None and not has_bias
         )
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (
@@ -667,7 +682,13 @@ class FlashAttentionForwardSm100:
                 ) // smem_size_load_per_stage
                 kv_stage = max(min(kv_stage, 8), 2)
             else:
-                kv_stage = 2
+                # Plain fp8 K/V (no dequant): K and V are 1 byte, so the same
+                # smem budget holds up to 6 stages for hdim 192/128 instead of
+                # the 2 the dequant path needs; keep the budget formula.
+                kv_stage = max(
+                    min((224 * 1024 - smem_size_q_o_bias) // smem_size_kv_per_stage, 8),
+                    2,
+                )
                 v_mma_stage = 1 if self.has_bias and self.q_stage == 2 else kv_stage
         self.kv_stage = kv_stage
         self.v_mma_stage = v_mma_stage
@@ -2308,6 +2329,8 @@ class FlashAttentionForwardSm100:
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
             softmax_loop = partial(
                 self.softmax_loop,
+                tOtO=tOtO,
+                thr_mma_pv=thr_mma_pv,
                 softmax_scale_log2=softmax_scale_log2,
                 softmax_scale=softmax_scale,
                 descale_tensors=descale_tensors,
@@ -3764,6 +3787,8 @@ class FlashAttentionForwardSm100:
         sBias: Optional[cute.Tensor] = None,
         bias_s2r_tiled_copy: Optional[cute.TiledCopy] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
+        tOtO: Optional[cute.Tensor] = None,
+        thr_mma_pv: Optional[cute.ThrMma] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -3986,6 +4011,8 @@ class FlashAttentionForwardSm100:
 
             softmax_step = partial(
                 self.softmax_step,
+                tOtO=tOtO,
+                thr_mma_pv=thr_mma_pv,
                 softmax=softmax,
                 thr_mma_qk=thr_mma_qk,
                 pipeline_s_p_o=pipeline_s_p_o,
@@ -4314,6 +4341,8 @@ class FlashAttentionForwardSm100:
         bias_si_consumer_state: Optional[pipeline.PipelineState] = None,
         tiled_tmem_load_red: Optional[cute.TiledCopy] = None,
         tStS_t2r_red: Optional[cute.Tensor] = None,
+        tOtO: Optional[cute.Tensor] = None,
+        thr_mma_pv: Optional[cute.ThrMma] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -4349,8 +4378,13 @@ class FlashAttentionForwardSm100:
         )
         # Tiles without masking take the row max from the sm_103 reducing TMEM load.
         use_red_max = const_expr(self.use_tmem_load_red_max and mask_fn is None)
+        pipelined = const_expr(
+            self.pipelined_softmax and self.v_mma_dtype.width == 8 and not is_first and mask_fn is None
+        )
         tile_row_max = None
-        if const_expr(use_red_max):
+        if const_expr(pipelined):
+            pass  # loads happen inside the pipelined block below
+        elif const_expr(use_red_max):
             num_t2r = cute.size(tStS_t2r_red, mode=[2])
             tSrMax = cute.make_rmem_tensor(
                 cute.make_layout((1, num_t2r)), self.qk_acc_dtype
@@ -4430,9 +4464,15 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        row_max, acc_scale = softmax.update_row_max(
-            tSrS_t2r.load(), is_first, tile_row_max=tile_row_max
-        )
+        if const_expr(pipelined):
+            # provisional: the correction warps get acc_scale = 1 right away;
+            # a moved max is handled below by this warp itself.
+            row_max = softmax.row_max[0]
+            acc_scale = Float32(1.0)
+        else:
+            row_max, acc_scale = softmax.update_row_max(
+                tSrS_t2r.load(), is_first, tile_row_max=tile_row_max
+            )
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_rmem_tensor(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
@@ -4447,7 +4487,8 @@ class FlashAttentionForwardSm100:
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
+        if const_expr(not pipelined):
+            softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
@@ -4479,6 +4520,50 @@ class FlashAttentionForwardSm100:
                     tSrP_r2t,
                     ex2_emu_freq=self.ex2_emu_freq,
                     ex2_emu_start_frg=self.ex2_emu_start_frg,
+                )
+        elif const_expr(pipelined):
+            n_frg = cute.size(tSrS_t2r, mode=[2])
+            m_old = softmax.row_max[0]
+            tile_max = -cutlass.Float32.inf
+            tSrMax = cute.make_rmem_tensor(cute.make_layout((1, n_frg)), self.qk_acc_dtype)
+            cute.copy_atom_call(
+                tiled_tmem_load_red, tStS_t2r_red[None, 0, 0], (tSrS_t2r[None, 0, 0], tSrMax[None, 0])
+            )
+            row_max_use = m_old
+            for i in cutlass.range_constexpr(n_frg):
+                if const_expr(i + 1 < n_frg):
+                    # issue the next fragment's load before this fragment's exp
+                    cute.copy_atom_call(
+                        tiled_tmem_load_red,
+                        tStS_t2r_red[None, 0, i + 1],
+                        (tSrS_t2r[None, 0, i + 1], tSrMax[None, i + 1]),
+                    )
+                tile_max = tSrMax[0, i] if tSrMax[0, i] > tile_max else tile_max
+                if const_expr(i == n_frg - 1):
+                    # the whole tile has landed: decide the (lagging) max
+                    row_max_new = tile_max if tile_max > m_old else m_old
+                    row_max_use, acc_scale = softmax.update_row_max_from_local(row_max_new, False)
+                    if cute.arch.vote_ballot_sync(acc_scale < Float32(1.0)) != 0:
+                        # rare: the max moved beyond the lag. O_{n-1} is complete
+                        # (S_n is visible) and PV_n waits for the P release below,
+                        # so rescale this warp's own O rows and the fp32 values of
+                        # the fragments already exponentiated against m_old.
+                        thread_idx = thr_tmem_load.thr_idx
+                        self.correction_rescale(
+                            thr_mma_pv, tOtO[None, None, None, stage], thread_idx, acc_scale
+                        )
+                        for jj in cutlass.range(0, (n_frg - 1) * 32, 2, unroll_full=True):
+                            tSrS_t2r[jj], tSrS_t2r[jj + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_t2r[jj], tSrS_t2r[jj + 1]), (acc_scale, acc_scale)
+                            )
+                frag = tSrS_t2r[None, None, i]
+                softmax.scale_subtract_rowmax(frag, row_max_use)
+                for k in cutlass.range_constexpr(0, 32, 2):
+                    frag[k] = cute.math.exp2(frag[k], fastmath=True)
+                    frag[k + 1] = cute.math.exp2(frag[k + 1], fastmath=True)
+            for i in cutlass.range_constexpr(n_frg):
+                tSrP_r2t[None, None, i].store(
+                    tSrS_t2r[None, None, i].load().to(tSrP_r2t.element_type)
                 )
         else:
             softmax.apply_exp2_convert(

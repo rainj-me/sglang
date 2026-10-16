@@ -109,11 +109,13 @@ def _get_device_num_sms(device: torch.device) -> int:
 
 def _tmem_load_red_max_enabled() -> bool:
     """Whether the SM100 forward kernel takes the softmax row max from the sm_103
-    tcgen05.ld.red TMEM load (on by default; ignored on other architectures).
+    tcgen05.ld.red TMEM load (off by default; ignored on other architectures).
 
-    SGLANG_FA4_TMEM_LOAD_RED_MAX=0 falls back to the FMNMX reduction.
+    Measured on GB300 for the 192/128 fp8 MLA prefill shape, the reduced
+    32-column loads cost more than the FMNMX tree they remove (causal 2.66 vs
+    2.98 PFLOPS). SGLANG_FA4_TMEM_LOAD_RED_MAX=1 re-enables it.
     """
-    return os.environ.get("SGLANG_FA4_TMEM_LOAD_RED_MAX", "1") != "0"
+    return os.environ.get("SGLANG_FA4_TMEM_LOAD_RED_MAX", "0") == "1"
 
 
 def _validate_head_dims(
