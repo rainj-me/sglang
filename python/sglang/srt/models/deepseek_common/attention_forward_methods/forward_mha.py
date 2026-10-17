@@ -468,11 +468,23 @@ class DeepseekMHAForwardMixin:
         )
         kv = self.kv_b_proj(kv_a_normed)[0]
         kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
-        prefix_k, prefix_v = backend.pack_prefix_chunk_kv(
-            kv[..., : self.qk_nope_head_dim],
-            k_pe,
-            kv[..., self.qk_nope_head_dim :],
-        )
+        pack_fused = getattr(backend, "pack_fused_prefix_extend", None)
+        if pack_fused is not None:
+            # backend wants one contiguous [prefix | chunk] buffer per request
+            prefix_k, prefix_v = pack_fused(
+                kv[..., : self.qk_nope_head_dim],
+                k_pe,
+                kv[..., self.qk_nope_head_dim :],
+                k,
+                v,
+                forward_batch,
+            )
+        else:
+            prefix_k, prefix_v = backend.pack_prefix_chunk_kv(
+                kv[..., : self.qk_nope_head_dim],
+                k_pe,
+                kv[..., self.qk_nope_head_dim :],
+            )
         del kv_a_normed, k_pe, kv
 
         forward_batch.mha_return_lse = False

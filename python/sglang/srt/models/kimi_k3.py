@@ -886,16 +886,34 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
-        mega_moe_pre_dispatch(
-            routed_input,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-        )
+        mma_type = _mega_moe_mma_type(self.experts)
+        if mma_type == "mxf4xmxf4":
+            # W4A4: activations are quantized to MXFP4 (per-32 UE8M0 scales)
+            # by DeepGEMM's own pre-dispatch; the sglang kernel emits FP8 only.
+            # The routed GEMMs then run at the FP4 tensor-core rate (B300: 3x fp8).
+            deep_gemm.mega_moe_pre_dispatch(
+                routed_input,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                num_tokens=num_tokens,
+                group_size=32,
+                mma_type=mma_type,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                routed_input,
+                topk_ids_in,
+                topk_weights_in,
+                buf.x,
+                buf.x_sf,
+                buf.topk_idx,
+                buf.topk_weights,
+                quant_group_size=32,
+            )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),

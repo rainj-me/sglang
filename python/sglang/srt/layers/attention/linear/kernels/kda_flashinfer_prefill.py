@@ -136,7 +136,11 @@ class FlashInferKDAPrefillKernel(LinearAttnKernelBase):
             g=g[:, : q.shape[1]].contiguous(),
             beta=beta[:, : q.shape[1]].contiguous(),
             A_log=A_log.reshape(-1).float().contiguous(),
-            dt_bias=dt_bias.reshape(q.shape[2], 128).float().contiguous(),
+            # FlashInfer's grouped-CTA recurrent kernel (every multi-token call,
+            # i.e. extends with a cached prefix) indexes dt_bias as a flat [H*K]
+            # tensor and asserts a unit leading stride; a [H, K] view fails at
+            # compile time ("Expected strides[leading_dim] == 1, but got 128").
+            dt_bias=dt_bias.reshape(-1).float().contiguous(),
             initial_state=ssm_states,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,

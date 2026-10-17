@@ -23,6 +23,7 @@ from sglang.kernels.ops.kvcache.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -397,6 +398,101 @@ class FlashAttentionBackend(AttentionBackend):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return mla_kv_pack_quantize_fp8(
             k_nope, k_pe, v, fp8_dtype=torch.float8_e4m3fn, enable_pdl=False
+        )
+
+    @property
+    def pack_all_prefix_chunks(self) -> bool:
+        """Pack the complete prefix once when it fits the chunk capacity (FA4, fp8 KV).
+        Only used by the opt-in fused prefix+extend path (F7)."""
+        return (
+            self.pack_prefix_chunk_kv is not None
+            and envs.SGLANG_FA4_FUSE_PREFIX_EXTEND.get()
+        )
+
+    @property
+    def fuse_prefix_into_extend(self) -> bool:
+        """Attend the packed prefix and the current chunk in one causal FA4 launch.
+        Opt-in (SGLANG_FA4_FUSE_PREFIX_EXTEND=1): it halves the attention launches
+        and drops the LSE merges, but those cost ~4 ms per 128k request, and the
+        single-shot prefix projection it needs made 1M requests slower."""
+        return (
+            self.pack_prefix_chunk_kv is not None
+            and envs.SGLANG_FA4_FUSE_PREFIX_EXTEND.get()
+        )
+
+    def pack_fused_prefix_extend(
+        self,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        v_dense: torch.Tensor,
+        k_chunk: torch.Tensor,
+        v_chunk: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build one contiguous fp8 K/V buffer laid out request-major as
+        [prefix_r | chunk_r], packing the projected prefix straight into it
+        (no second copy of the prefix) and copying the already-packed chunk.
+        Consumed by forward_extend through forward_batch.fused_prefix_k/v."""
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        total = int(sum(prefix_lens) + sum(extend_lens))
+        num_heads, qk_dim = k_chunk.shape[1], k_chunk.shape[2]
+        v_dim = v_chunk.shape[2]
+        k_all = torch.empty(
+            (total, num_heads, qk_dim), dtype=torch.float8_e4m3fn, device=k_chunk.device
+        )
+        v_all = torch.empty(
+            (total, num_heads, v_dim), dtype=torch.float8_e4m3fn, device=k_chunk.device
+        )
+        p_off = q_off = out_off = 0
+        for plen, elen in zip(prefix_lens, extend_lens):
+            plen, elen = int(plen), int(elen)
+            if plen > 0:
+                mla_kv_pack_quantize_fp8(
+                    k_nope[p_off : p_off + plen],
+                    k_pe[p_off : p_off + plen],
+                    v_dense[p_off : p_off + plen],
+                    k_out=k_all[out_off : out_off + plen],
+                    v_out=v_all[out_off : out_off + plen],
+                    fp8_dtype=torch.float8_e4m3fn,
+                    enable_pdl=False,
+                )
+            k_all[out_off + plen : out_off + plen + elen].copy_(
+                k_chunk[q_off : q_off + elen]
+            )
+            v_all[out_off + plen : out_off + plen + elen].copy_(
+                v_chunk[q_off : q_off + elen]
+            )
+            p_off += plen
+            q_off += elen
+            out_off += plen + elen
+        return k_all, v_all
+
+    def _fused_prefix_extend_fa4(self, q, k_all, v_all, layer, forward_batch, out):
+        """One causal FA4 call over [prefix | chunk] per request (bottom-right
+        aligned causal mask): no per-piece launches, no LSE merge, no fixup."""
+        metadata = self.forward_metadata
+        kv_lens = [
+            int(p) + int(e)
+            for p, e in zip(
+                forward_batch.extend_prefix_lens_cpu, forward_batch.extend_seq_lens_cpu
+            )
+        ]
+        cu_k = torch.zeros(len(kv_lens) + 1, dtype=torch.int32, device=q.device)
+        cu_k[1:] = torch.tensor(kv_lens, dtype=torch.int32, device=q.device).cumsum(0)
+        return self.flash_attn_varlen_func(
+            q=q.to(torch.float8_e4m3fn).view(-1, layer.tp_q_head_num, layer.head_dim),
+            k=k_all,
+            v=v_all,
+            cu_seqlens_q=metadata.cu_seqlens_q,
+            cu_seqlens_k=cu_k,
+            max_seqlen_q=metadata.max_seq_len_q,
+            max_seqlen_k=max(kv_lens),
+            softmax_scale=layer.scaling,
+            causal=True,
+            return_softmax_lse=False,
+            out=out,
+            ver=self.fa_impl_ver,
         )
 
     def _prepare_mha_qkv_dtypes(self, q, k, v):
@@ -1903,6 +1999,17 @@ class FlashAttentionBackend(AttentionBackend):
                 and not forward_batch.forward_mode.is_draft_extend_v2()
             ):
                 # Do multi-head attention with chunked prefix cache
+                fused_k = getattr(forward_batch, "fused_prefix_k", None)
+                if fused_k is not None and self.fa_impl_ver == 4:
+                    # F7: fused_prefix_k/v hold [prefix | chunk] per request
+                    return self._fused_prefix_extend_fa4(
+                        q,
+                        fused_k,
+                        forward_batch.fused_prefix_v,
+                        layer,
+                        forward_batch,
+                        _fa_out,
+                    )
                 q_mha, k_mha, v_mha = self._prepare_mha_qkv_dtypes(q, k, v)
                 if forward_batch.attn_attend_prefix_cache:
                     assert not get_schedule().disable_chunked_prefix_cache

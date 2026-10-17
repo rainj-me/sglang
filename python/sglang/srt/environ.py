@@ -1960,6 +1960,9 @@ class Envs:
     # activation scales. Direct quantization without calibration; off by
     # default until accuracy is validated for the deployment.
     SGLANG_K3_USE_ONLINE_FP8_ATTN = EnvBool(False)
+    # FA4 MLA prefill: attend the packed prefix and the current chunk in one causal
+    # launch (F7). Measured neutral on Kimi-K3 (128k 2840 vs 2838 ms, 1M 50.6 vs 50.2 s), so off.
+    SGLANG_FA4_FUSE_PREFIX_EXTEND = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
